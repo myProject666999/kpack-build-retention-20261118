@@ -127,15 +127,31 @@ func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
 	image = image.DeepCopy()
 	image.SetDefaults(ctx)
 
-	image, err = c.reconcileImage(ctx, image)
+	// List the Image's Builds once. Both the build decision and retention read
+	// this snapshot, so a single reconcile cannot act on two different views of
+	// the same history.
+	builds, err := c.fetchAllBuilds(image)
+	if err != nil {
+		return fmt.Errorf("failed fetching builds for image: %w", err)
+	}
+
+	image, err = c.reconcileImage(ctx, image, builds)
 	if err != nil {
 		return err
 	}
 
-	return c.updateStatus(ctx, image)
+	// Write the status before pruning. Retention is a background concern: a slow
+	// or failing Delete must not delay the Image reporting the result of the
+	// build it just reconciled (or lose that status update because the
+	// reconciler returned early).
+	if err := c.updateStatus(ctx, image); err != nil {
+		return err
+	}
+
+	return c.deleteOldBuilds(ctx, image, builds)
 }
 
-func (c *Reconciler) reconcileImage(ctx context.Context, image *buildapi.Image) (*buildapi.Image, error) {
+func (c *Reconciler) reconcileImage(ctx context.Context, image *buildapi.Image, builds buildList) (*buildapi.Image, error) {
 	c.Tracker.Track(reconcilerKeyForBuilderKind(image), image.NamespacedName())
 
 	builder, err := c.DuckBuilderLister.Namespace(image.Namespace).Get(image.Spec.Builder)
@@ -146,10 +162,7 @@ func (c *Reconciler) reconcileImage(ctx context.Context, image *buildapi.Image) 
 		return image, nil
 	}
 
-	lastBuild, err := c.fetchLastBuild(image)
-	if err != nil {
-		return nil, err
-	}
+	lastBuild := builds.lastBuild
 
 	if lastBuild.IsRunning() {
 		image.Status.Conditions = buildRunningCondition(lastBuild, builder)
@@ -171,7 +184,7 @@ func (c *Reconciler) reconcileImage(ctx context.Context, image *buildapi.Image) 
 		return nil, err
 	}
 
-	return image, c.deleteOldBuilds(ctx, image)
+	return image, nil
 }
 
 func (c *Reconciler) reconcileSourceResolver(ctx context.Context, image *buildapi.Image) (*buildapi.SourceResolver, error) {
@@ -234,33 +247,6 @@ func (c *Reconciler) reconcileBuildCache(ctx context.Context, image *buildapi.Im
 	return existing.Name, errors.Wrap(err, "cannot update persistent volume claim")
 }
 
-func (c *Reconciler) deleteOldBuilds(ctx context.Context, image *buildapi.Image) error {
-	builds, err := c.fetchAllBuilds(image)
-	if err != nil {
-		return fmt.Errorf("failed fetching all builds for image: %s", err)
-	}
-
-	if builds.NumberFailedBuilds() > *image.Spec.FailedBuildHistoryLimit {
-		oldestFailedBuild := builds.OldestFailure()
-
-		err := c.Client.KpackV1alpha2().Builds(image.Namespace).Delete(ctx, oldestFailedBuild.Name, metav1.DeleteOptions{})
-		if err != nil {
-			return fmt.Errorf("failed deleting failed build: %s", err)
-		}
-	}
-
-	if builds.NumberSuccessfulBuilds() > *image.Spec.SuccessBuildHistoryLimit {
-		oldestSuccess := builds.OldestSuccess()
-
-		err := c.Client.KpackV1alpha2().Builds(image.Namespace).Delete(ctx, oldestSuccess.Name, metav1.DeleteOptions{})
-		if err != nil {
-			return fmt.Errorf("failed deleting successful build: %s", err)
-		}
-	}
-
-	return nil
-}
-
 func (c *Reconciler) fetchAllBuilds(image *buildapi.Image) (buildList, error) {
 	imageNameReq, err := labels.NewRequirement(buildapi.ImageLabel, selection.DoubleEquals, []string{image.Name})
 	if err != nil {
@@ -273,15 +259,7 @@ func (c *Reconciler) fetchAllBuilds(image *buildapi.Image) (buildList, error) {
 		return buildList{}, fmt.Errorf("list builds: %s", err)
 	}
 
-	return newBuildList(builds)
-}
-
-func (c *Reconciler) fetchLastBuild(image *buildapi.Image) (*buildapi.Build, error) {
-	builds, err := c.fetchAllBuilds(image)
-	if err != nil {
-		return nil, err
-	}
-	return builds.lastBuild, nil
+	return newBuildList(builds), nil
 }
 
 func (c *Reconciler) updateStatus(ctx context.Context, desired *buildapi.Image) error {

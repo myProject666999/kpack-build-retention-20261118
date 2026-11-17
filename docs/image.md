@@ -16,8 +16,8 @@ The following defines the relevant fields of the `image` resource spec in more d
   - `volume.size`: Creates a Volume Claim of the given size
   - `volume.storageClassName`: (Optional) Creates a Volume Claim of the given storageClassName. If unset, the default storage class is used. The field is immutable.
   - `registry.tag`: Creates an image with cached contents
-- `failedBuildHistoryLimit`: The maximum number of failed builds for an image that will be retained.
-- `successBuildHistoryLimit`: The maximum number of successful builds for an image that will be retained.
+- `failedBuildHistoryLimit`: The maximum number of failed builds for an image that will be retained. Must be greater than 0. Defaults to 10.
+- `successBuildHistoryLimit`: The maximum number of successful builds for an image that will be retained. Must be greater than 0. Defaults to 10.
 - `imageTaggingStrategy`: Allow for builds to be additionally tagged with the build number. Valid options are `None` and `BuildNumber`.
 - `build`: Configuration that is passed to every image build. See [Build Configuration](#build-config) section below.
 - `defaultProcess`: The [default process type](https://buildpacks.io/docs/app-developer-guide/run-an-app/) for the built OCI image
@@ -327,6 +327,22 @@ spec:
         cpu: 50m
         memory: 512M
 ```
+
+### <a id='build-history'></a> Build History Retention
+
+kpack deletes old `Build` resources so that an `Image` does not accumulate history forever. `failedBuildHistoryLimit` and `successBuildHistoryLimit` are counted independently: the newest `successBuildHistoryLimit` successful builds and the newest `failedBuildHistoryLimit` failed builds are kept, and older ones are deleted.
+
+The following builds are always kept, even if that takes an image above its configured limits:
+
+- A build that is still running. An in-progress build is never deleted, no matter how old it is or how small the limits are.
+- The build named by `status.latestBuildRef`, which `kp build logs <image>` and the status message refer to.
+- The build that produced `status.latestImage`, so the image kpack reports as current always has a corresponding build. When the most recent build failed, this is an older successful build.
+
+Ordering is by build number (the `image.kpack.io/buildNumber` label), not by creation time, so "the newest builds" is well defined even when builds share a timestamp or the controller restarts. A build's number is taken from its name (`<image>-build-<n>`) if the label is missing.
+
+Cleanup runs as part of the image reconcile, after the image status is written. It deletes at most 20 builds per reconcile and requeues to finish the rest, so lowering a limit on an image with a very long history does not issue thousands of deletes at once. If deleting one build fails, the remaining builds are still deleted and the failure is retried on a later reconcile.
+
+Note that a history limit of `0` is not valid: the value must be greater than `0`, and an unset value defaults to `10`.
 
 #### Status
 
